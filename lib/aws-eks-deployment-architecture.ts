@@ -13,6 +13,7 @@ import rds = require('@aws-cdk/aws-rds');
 import yaml = require('js-yaml');
 import targets = require("@aws-cdk/aws-events-targets");
 import fs = require('fs');
+import * as request from 'sync-request';
 
 
 export class AwsEksDeploymentArchitectureCdkStack extends cdk.Stack {
@@ -62,7 +63,8 @@ export class AwsEksDeploymentArchitectureCdkStack extends cdk.Stack {
     cluster.addFargateProfile('fargate-profile', {
         selectors: [
             { namespace: "kube-system"},
-            { namespace: "default"}
+            { namespace: "default"},
+            { namespace: name }
         ],
         subnetSelection: { subnetType: ec2.SubnetType.PRIVATE_WITH_NAT },
         vpc,
@@ -122,12 +124,56 @@ export class AwsEksDeploymentArchitectureCdkStack extends cdk.Stack {
         ]
     });
 
+
+    ///////////////////////////////////
+    // Install Application Load balancer controller
+
+    const iamIngressPolicyDocument = JSON.parse(fs.readFileSync('files/iam/aws-lb-controller-v2.3.0-iam-policy.json').toString());
+    const iamIngressPolicy = new iam.Policy(this, 'aws-load-balancer-controller-policy', {
+        policyName: 'AWSLoadBalancerControllerIAMPolicy',
+        document: iam.PolicyDocument.fromJson(iamIngressPolicyDocument),
+    })
+
+    const sa = cluster.addServiceAccount('aws-load-balancer-controller', {
+        name: 'aws-load-balancer-controller',
+        namespace: 'kube-system',
+    });
+    sa.role.attachInlinePolicy(iamIngressPolicy);
+
+    const awsLoadbalancercCRDsUrl = 'https://raw.githubusercontent.com/aws/eks-charts/master/stable/aws-load-balancer-controller/crds/crds.yaml'
+    const awsLoadbalancercCRDsManifest = yaml.loadAll(request.default('GET', awsLoadbalancercCRDsUrl).getBody().toString()) as Record<string, any>[];
+    const awsLoadbalancercCRDsManifestApply = new eks.KubernetesManifest(this, 'aws-lb-crds-apply', {
+        cluster,
+        manifest: awsLoadbalancercCRDsManifest,
+        prune: false
+    });
+
+    const chart = cluster.addHelmChart('AWSLBCHelmChart', {
+        chart: 'aws-load-balancer-controller',
+        release: 'aws-load-balancer-controller',
+        repository: 'https://aws.github.io/eks-charts',
+        namespace: 'kube-system',
+        createNamespace: false,
+        values: {
+            'clusterName': `${cluster.clusterName}`,
+            'serviceAccount': {
+                'create': false,
+                'name': sa.serviceAccountName,
+                'annotations': {
+                    'eks.amazonaws.com/role-arn': sa.role.roleArn
+                }
+            }
+        }
+    });
+    chart.node.addDependency(awsLoadbalancercCRDsManifestApply);
+
     const manifestGame = yaml.loadAll(fs.readFileSync('files/eks/game-2048.yaml', 'utf-8')) as Record<string, any>[];
     const manifestGameApply = new eks.KubernetesManifest(this, 'game-2048-deploy', {
         cluster,
         manifest: manifestGame,
         prune: false
     });
+    manifestGameApply.node.addDependency(chart)
 
     const ecrRepository = new ecr.Repository(this, "image", {
         repositoryName: name + '-amazon-eks' 
@@ -273,6 +319,7 @@ export class AwsEksDeploymentArchitectureCdkStack extends cdk.Stack {
         actions: [buildAction]
     });
 
+    ///
     const loadBalancer = new elb.ApplicationLoadBalancer(this, 'alb', {
         vpc,
         internetFacing: true,
