@@ -9,7 +9,7 @@
 
 ## Architecture
 
-![arch][./architecture.png]
+![arch](./architecture.png)
 
 ## Install
 
