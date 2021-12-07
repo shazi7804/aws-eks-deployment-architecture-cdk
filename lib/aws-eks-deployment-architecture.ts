@@ -155,6 +155,7 @@ export class AwsEksDeploymentArchitectureCdkStack extends cdk.Stack {
     efsCSI.node.addDependency(nodeGroup);
     efsCSI.node.addDependency(cluster.openIdConnectProvider);
     efsCSI.node.addDependency(cluster.awsAuth);
+    efsCSI.node.addDependency(awsLoadBalancerControllerChart);
 
     ///////////////////////////////////
     // install game-2048
