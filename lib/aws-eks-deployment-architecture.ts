@@ -309,41 +309,41 @@ export class AwsEksDeploymentArchitectureCdkStack extends cdk.Stack {
         actions: [buildAction]
     });
 
-    // const rdb = new rds.DatabaseCluster(this, 'rds', {
-    //     engine: rds.DatabaseClusterEngine.auroraMysql({ version: rds.AuroraMysqlEngineVersion.VER_2_08_1 }),
-    //     instanceProps: {
-    //       vpcSubnets: {
-    //         subnetType: ec2.SubnetType.PRIVATE_WITH_NAT,
-    //       },
-    //       vpc,
-    //     },
-    // });
+    const rdb = new rds.DatabaseCluster(this, 'rds', {
+        engine: rds.DatabaseClusterEngine.auroraMysql({ version: rds.AuroraMysqlEngineVersion.VER_2_08_1 }),
+        instanceProps: {
+          vpcSubnets: {
+            subnetType: ec2.SubnetType.PRIVATE_WITH_NAT,
+          },
+          vpc,
+        },
+    });
 
-    // const elasticacheSecurityGroup = new ec2.SecurityGroup(this, 'elasticache-sg', {
-    //     vpc,
-    //     allowAllOutbound: true,
-    //     securityGroupName: name + '-elasticache-sg'
-    // });
-    // elasticacheSecurityGroup.addIngressRule(
-    //     ec2.Peer.anyIpv4(),
-    //     ec2.Port.tcp(11511),
-    //     'Allows Port 11511 access from Internet'
-    // )
+    const elasticacheSecurityGroup = new ec2.SecurityGroup(this, 'elasticache-sg', {
+        vpc,
+        allowAllOutbound: true,
+        securityGroupName: name + '-elasticache-sg'
+    });
+    elasticacheSecurityGroup.addIngressRule(
+        ec2.Peer.anyIpv4(),
+        ec2.Port.tcp(11511),
+        'Allows Port 11511 access from Internet'
+    )
 
-    // const elasticacheSubnetGroup = new elasticache.CfnSubnetGroup(this, 'subnet-group', {
-    //     cacheSubnetGroupName: name + '-subnet',
-    //     subnetIds: vpc.privateSubnets.map((subnet) => subnet.subnetId),
-    //     description: `${id} redis subnet group`,
-    // });
+    const elasticacheSubnetGroup = new elasticache.CfnSubnetGroup(this, 'subnet-group', {
+        cacheSubnetGroupName: name + '-subnet',
+        subnetIds: vpc.privateSubnets.map((subnet) => subnet.subnetId),
+        description: `${id} redis subnet group`,
+    });
 
-    // new elasticache.CfnCacheCluster(this, 'elasticache', {
-    //     cacheNodeType: 'cache.t3.micro',
-    //     engine: 'redis',
-    //     numCacheNodes: 1,
-    //     clusterName: name + '-memcached',
-    //     vpcSecurityGroupIds: [elasticacheSecurityGroup.securityGroupId],
-    //     cacheSubnetGroupName: elasticacheSubnetGroup.ref
-    // })
+    new elasticache.CfnCacheCluster(this, 'elasticache', {
+        cacheNodeType: 'cache.t3.micro',
+        engine: 'redis',
+        numCacheNodes: 1,
+        clusterName: name + '-memcached',
+        vpcSecurityGroupIds: [elasticacheSecurityGroup.securityGroupId],
+        cacheSubnetGroupName: elasticacheSubnetGroup.ref
+    })
 
   }
 }
