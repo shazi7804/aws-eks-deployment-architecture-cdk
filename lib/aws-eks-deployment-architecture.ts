@@ -13,7 +13,6 @@ import rds = require('@aws-cdk/aws-rds');
 import yaml = require('js-yaml');
 import targets = require("@aws-cdk/aws-events-targets");
 import fs = require('fs');
-import * as request from 'sync-request';
 
 
 export class AwsEksDeploymentArchitectureCdkStack extends cdk.Stack {
@@ -44,14 +43,7 @@ export class AwsEksDeploymentArchitectureCdkStack extends cdk.Stack {
         assumedBy: new iam.AccountRootPrincipal()
     });
 
-    const podExecutionRole = new iam.Role(this, "fargate-profile-role", {
-        assumedBy: new iam.ServicePrincipal("eks-fargate-pods.amazonaws.com"),
-        managedPolicies: [
-          iam.ManagedPolicy.fromAwsManagedPolicyName("AmazonEKSFargatePodExecutionRolePolicy")
-        ]
-    })
-
-    const cluster = new eks.Cluster(this, 'eks-fargate-cluster', {
+    const cluster = new eks.Cluster(this, 'eks-cluster', {
         clusterName: name + '-eks-fargate',
         vpc,
         vpcSubnets: [{ subnetType: ec2.SubnetType.PRIVATE_WITH_NAT }],
@@ -60,16 +52,12 @@ export class AwsEksDeploymentArchitectureCdkStack extends cdk.Stack {
         version: eks.KubernetesVersion.V1_21,
         endpointAccess: eks.EndpointAccess.PUBLIC_AND_PRIVATE,
     });
-    cluster.addFargateProfile('fargate-profile', {
-        selectors: [
-            { namespace: "kube-system"},
-            { namespace: "default"},
-            { namespace: name }
-        ],
-        subnetSelection: { subnetType: ec2.SubnetType.PRIVATE_WITH_NAT },
-        vpc,
-        podExecutionRole
-    });
+
+    const nodeGroup = cluster.addAutoScalingGroupCapacity('node-group', {
+        instanceType: new ec2.InstanceType('c5.xlarge'),
+        maxInstanceLifetime: cdk.Duration.days(7),
+        minCapacity: 2,
+    })
 
 
     // Patch aws-node daemonset to use IRSA via EKS Addons, do before nodes are created
@@ -115,19 +103,10 @@ export class AwsEksDeploymentArchitectureCdkStack extends cdk.Stack {
         username: 'masterRole',
         groups: ['system:masters']
     });
-    awsAuth.addRoleMapping(podExecutionRole, {
-        username: 'system:node:{{SessionName}}',
-        groups: [
-            'system:bootstrappers',
-            'system:nodes',
-            'system:node-proxier'
-        ]
-    });
 
 
     ///////////////////////////////////
-    // Install Application Load balancer controller
-
+    // install AWS load balancer via Helm charts
     const iamIngressPolicyDocument = JSON.parse(fs.readFileSync('files/iam/aws-lb-controller-v2.3.0-iam-policy.json').toString());
     const iamIngressPolicy = new iam.Policy(this, 'aws-load-balancer-controller-policy', {
         policyName: 'AWSLoadBalancerControllerIAMPolicy',
@@ -140,40 +119,52 @@ export class AwsEksDeploymentArchitectureCdkStack extends cdk.Stack {
     });
     sa.role.attachInlinePolicy(iamIngressPolicy);
 
-    const awsLoadbalancercCRDsUrl = 'https://raw.githubusercontent.com/aws/eks-charts/master/stable/aws-load-balancer-controller/crds/crds.yaml'
-    const awsLoadbalancercCRDsManifest = yaml.loadAll(request.default('GET', awsLoadbalancercCRDsUrl).getBody().toString()) as Record<string, any>[];
-    const awsLoadbalancercCRDsManifestApply = new eks.KubernetesManifest(this, 'aws-lb-crds-apply', {
-        cluster,
-        manifest: awsLoadbalancercCRDsManifest,
-        prune: false
+    const awsLoadBalancerControllerChart = cluster.addHelmChart('aws-loadbalancer-controller', {
+      chart: 'aws-load-balancer-controller',
+      repository: 'https://aws.github.io/eks-charts',
+      namespace: 'kube-system',
+      release: 'aws-load-balancer-controller',
+      version: '1.3.2', // mapping to v2.3.0
+      wait: true,
+      timeout: cdk.Duration.minutes(15),
+      values: {
+        clusterName: cluster.clusterName,
+        serviceAccount: {
+          create: false,
+          name: sa.serviceAccountName,
+        },
+        // must disable waf features for aws-cn partition
+        enableShield: false,
+        enableWaf: false,
+        enableWafv2: false,
+      },
     });
+    awsLoadBalancerControllerChart.node.addDependency(nodeGroup);
+    awsLoadBalancerControllerChart.node.addDependency(sa);
+    awsLoadBalancerControllerChart.node.addDependency(cluster.openIdConnectProvider);
+    awsLoadBalancerControllerChart.node.addDependency(cluster.awsAuth);
 
-    const chart = cluster.addHelmChart('AWSLBCHelmChart', {
-        chart: 'aws-load-balancer-controller',
-        release: 'aws-load-balancer-controller',
-        repository: 'https://aws.github.io/eks-charts',
-        namespace: 'kube-system',
-        createNamespace: false,
-        values: {
-            'clusterName': `${cluster.clusterName}`,
-            'serviceAccount': {
-                'create': false,
-                'name': sa.serviceAccountName,
-                'annotations': {
-                    'eks.amazonaws.com/role-arn': sa.role.roleArn
-                }
-            }
-        }
+    ///////////////////////////////////
+    // install EFS, EFS CSI driver via Helm charts
+    const efsCSI = cluster.addHelmChart('EFSCSIDriver', {
+        chart: 'aws-efs-csi-driver',
+        repository: 'https://kubernetes-sigs.github.io/aws-efs-csi-driver/',
+        release: 'aws-efs-csi-driver',
+        version: '2.2.0',
     });
-    chart.node.addDependency(awsLoadbalancercCRDsManifestApply);
+    efsCSI.node.addDependency(nodeGroup);
+    efsCSI.node.addDependency(cluster.openIdConnectProvider);
+    efsCSI.node.addDependency(cluster.awsAuth);
 
+    ///////////////////////////////////
+    // install game-2048
     const manifestGame = yaml.loadAll(fs.readFileSync('files/eks/game-2048.yaml', 'utf-8')) as Record<string, any>[];
     const manifestGameApply = new eks.KubernetesManifest(this, 'game-2048-deploy', {
         cluster,
         manifest: manifestGame,
         prune: false
     });
-    manifestGameApply.node.addDependency(chart)
+    manifestGameApply.node.addDependency(awsLoadBalancerControllerChart)
 
     const ecrRepository = new ecr.Repository(this, "image", {
         repositoryName: name + '-amazon-eks' 
@@ -186,7 +177,6 @@ export class AwsEksDeploymentArchitectureCdkStack extends cdk.Stack {
         repositoryName: name
     });
   
-    // const kubectlExecutionRole = iam.Role.fromRoleArn(this, 'amazon-eks-kubectl-role', "arn:aws:iam::" + this.account + ":role/AmazonEksKubectlRole")
     const codebuildKubectlExecutionRole = new iam.Role(this, "codebuild-kubectl-role", {
         roleName: 'AmazonCodeBuildKubectlRole',
         assumedBy: new iam.ServicePrincipal("codebuild.amazonaws.com"),
@@ -319,51 +309,41 @@ export class AwsEksDeploymentArchitectureCdkStack extends cdk.Stack {
         actions: [buildAction]
     });
 
-    ///
-    const loadBalancer = new elb.ApplicationLoadBalancer(this, 'alb', {
-        vpc,
-        internetFacing: true,
-        securityGroup: new ec2.SecurityGroup(this, 'AlbSecurityGroup', {
-            vpc,
-            allowAllOutbound: true
-        })
-    });
+    // const rdb = new rds.DatabaseCluster(this, 'rds', {
+    //     engine: rds.DatabaseClusterEngine.auroraMysql({ version: rds.AuroraMysqlEngineVersion.VER_2_08_1 }),
+    //     instanceProps: {
+    //       vpcSubnets: {
+    //         subnetType: ec2.SubnetType.PRIVATE_WITH_NAT,
+    //       },
+    //       vpc,
+    //     },
+    // });
 
-    const rdb = new rds.DatabaseCluster(this, 'rds', {
-        engine: rds.DatabaseClusterEngine.auroraMysql({ version: rds.AuroraMysqlEngineVersion.VER_2_08_1 }),
-        instanceProps: {
-          vpcSubnets: {
-            subnetType: ec2.SubnetType.PRIVATE_WITH_NAT,
-          },
-          vpc,
-        },
-    });
+    // const elasticacheSecurityGroup = new ec2.SecurityGroup(this, 'elasticache-sg', {
+    //     vpc,
+    //     allowAllOutbound: true,
+    //     securityGroupName: name + '-elasticache-sg'
+    // });
+    // elasticacheSecurityGroup.addIngressRule(
+    //     ec2.Peer.anyIpv4(),
+    //     ec2.Port.tcp(11511),
+    //     'Allows Port 11511 access from Internet'
+    // )
 
-    const elasticacheSecurityGroup = new ec2.SecurityGroup(this, 'elasticache-sg', {
-        vpc,
-        allowAllOutbound: true,
-        securityGroupName: name + '-elasticache-sg'
-    });
-    elasticacheSecurityGroup.addIngressRule(
-        ec2.Peer.anyIpv4(),
-        ec2.Port.tcp(11511),
-        'Allows Port 11511 access from Internet'
-    )
+    // const elasticacheSubnetGroup = new elasticache.CfnSubnetGroup(this, 'subnet-group', {
+    //     cacheSubnetGroupName: name + '-subnet',
+    //     subnetIds: vpc.privateSubnets.map((subnet) => subnet.subnetId),
+    //     description: `${id} redis subnet group`,
+    // });
 
-    const elasticacheSubnetGroup = new elasticache.CfnSubnetGroup(this, 'subnet-group', {
-        cacheSubnetGroupName: name + '-subnet',
-        subnetIds: vpc.privateSubnets.map((subnet) => subnet.subnetId),
-        description: `${id} redis subnet group`,
-    });
-
-    new elasticache.CfnCacheCluster(this, 'elasticache', {
-        cacheNodeType: 'cache.t3.micro',
-        engine: 'redis',
-        numCacheNodes: 1,
-        clusterName: name + '-memcached',
-        vpcSecurityGroupIds: [elasticacheSecurityGroup.securityGroupId],
-        cacheSubnetGroupName: elasticacheSubnetGroup.ref
-    })
+    // new elasticache.CfnCacheCluster(this, 'elasticache', {
+    //     cacheNodeType: 'cache.t3.micro',
+    //     engine: 'redis',
+    //     numCacheNodes: 1,
+    //     clusterName: name + '-memcached',
+    //     vpcSecurityGroupIds: [elasticacheSecurityGroup.securityGroupId],
+    //     cacheSubnetGroupName: elasticacheSubnetGroup.ref
+    // })
 
   }
 }
